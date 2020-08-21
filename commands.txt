@@ -1,0 +1,5 @@
+sh ip int br
+sh clock
+sh int
+sh ip route
+sh run
