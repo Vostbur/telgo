@@ -1,53 +1,55 @@
 package main
 
 import (
-	"errors"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"math/rand"
-	"net"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
-	"sync"
+	"telgo/telnet"
 	"time"
 )
 
-const (
-	// Порт telnet = 23
-	TCP_PORT = ":telnet"
-	// Каталог для вывода результатов. По умолчанию текущая дата в формате YYYY-MM-DD
-	OUTPUT_DIR = "qwe"
-)
-
-type Host struct {
-	conn net.Conn
-	node Node
-}
+// Каталог для вывода результатов. По умолчанию текущая дата в формате YYYY-MM-DD
+const OUTPUT_DIR = ""
 
 func main() {
-	invFile, cmdFile, err := parseArgs()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %s", err.Error())
-		return
+	// Разбор аргументов командной строки
+	// Формат: telcl.exe inventory_file.json command_file.txt
+	// Переменная invFile - inventory_file.json
+	// Формат:
+	// [
+	// {
+	//     "hostname":"R1",
+	//     "addr":"192.168.129.100",
+	//     "auth": {
+	//         "login": "cisco",
+	//         "password": "cisco",
+	//         "enable": "cisco"
+	//     }
+	// },
+	// ..
+	// Переменная cmdFile - command_file.txt
+	// Файл с командами cisco, разделенных по строкам
+	if len(os.Args) < 3 {
+		log.Fatal("Usage: telcl.exe inventory_file.json command_file.txt")
 	}
-
-	var nodes Nodes
-	err = nodes.GetNodes(invFile)
+	invFile, cmdFile := os.Args[1], os.Args[2]
+	// Читаем invFile и сохраняем []byte в jsonData
+	jsonData, err := ioutil.ReadFile(invFile)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %s", err.Error())
-		return
+		log.Fatal(err)
 	}
-
-	var commands Commands
-	err = commands.GetCommangs(cmdFile)
+	// Читаем cmdFile и сохраняем []byte в cmdData
+	cmdData, err := ioutil.ReadFile(cmdFile)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %s", err.Error())
-		return
+		log.Fatal(err)
 	}
-
+	// Разбиваем cmdData на строки и сохраняем как []string в cmdSlice
+	cmdSlice := strings.Split(string(cmdData), "\n")
 	// Задаем каталог для вывода результатов выполнения команд на устройствах.
 	// Имя каталога можно изменить в константе OUTPUT_DIR.
 	// По умолчанию - текущая дата в формате YYYY-MM-DD
@@ -61,77 +63,29 @@ func main() {
 	if err := makeDir(curDir); err != nil {
 		log.Fatal(err)
 	}
-
-	start := time.Now()
-
-	connections := make(chan Host, len(nodes.Nodes))
-	wg := &sync.WaitGroup{}
-	for _, node := range nodes.Nodes {
-		wg.Add(1)
-		go func(c chan Host, n Node, wg *sync.WaitGroup) {
-			defer wg.Done()
-			conn, err := connect(n.Addr + TCP_PORT)
-			if err != nil {
-				fmt.Println(err)
-				return
-			}
-			connections <- Host{conn, n}
-		}(connections, node, wg)
+	// Выполняем команды из cmdSlice на устройствах jsonData,
+	// резльтат rMap типа map[IP]command_output
+	rMap, err := telnet.Telnet(jsonData, cmdSlice)
+	if err != nil {
+		log.Fatal(err)
 	}
-	wg.Wait()
-	close(connections)
-
-	var mu sync.Mutex
-	for conn := range connections {
-		wg.Add(1)
-		go func(c Host, comms []string, wg *sync.WaitGroup) {
-			defer wg.Done()
-			if err := login(c.conn, c.node.Auth); err != nil {
-				fmt.Println(err.Error())
-				return
-			}
-			for _, cmd := range comms {
-				res, err := exec(c.conn, cmd)
-				if err != nil {
-					fmt.Println(err.Error())
-					continue
-				}
-
-				fileName := c.conn.RemoteAddr().String()
-				fileName = strings.Split(fileName, ":")[0] + ".txt"
-				fileName = filepath.Join(curDir, fileName)
-
-				mu.Lock()
-				f, err := os.OpenFile(fileName, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
-				if err != nil {
-					fmt.Println(err.Error())
-					mu.Unlock()
-					continue
-				}
-				_, err = f.WriteString(res)
-				if err != nil {
-					fmt.Println(err.Error())
-					f.Close()
-					mu.Unlock()
-					continue
-				}
-				f.Close()
-				mu.Unlock()
-				runtime.Gosched()
-			}
-		}(conn, commands.Cmd, wg)
+	// Сохраняем результат в файлы с именами по ip-адресам устройств
+	for k, v := range rMap {
+		fileName := strings.Split(k, ":")[0] + ".txt"
+		fileName = filepath.Join(curDir, fileName)
+		f, err := os.OpenFile(fileName, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+		if err != nil {
+			fmt.Println(err.Error())
+			continue
+		}
+		_, err = f.WriteString(v)
+		if err != nil {
+			fmt.Println(err.Error())
+			f.Close()
+			continue
+		}
+		f.Close()
 	}
-	wg.Wait()
-
-	duration := time.Since(start)
-	fmt.Printf("Duration: %d ms\n", duration.Milliseconds())
-}
-
-func parseArgs() (string, string, error) {
-	if len(os.Args) < 3 {
-		return "", "", errors.New("Usage: telcl.exe inventory_file.json command_file.txt\n")
-	}
-	return os.Args[1], os.Args[2], nil
 }
 
 func makeDir(d string) (err error) {
